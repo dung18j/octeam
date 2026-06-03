@@ -13,10 +13,10 @@ Workflow:
 Steps: analyze -> plan -> plan-check -> implement -> review
 """
 
-import os
 import sys
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 
 STEPS = ["analyze", "plan", "plan-check", "implement", "review"]
@@ -75,29 +75,32 @@ STEP_INSTRUCTIONS = {
 }
 
 
-def run(cmd, cwd=None):
-    result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+def run(cmd: list[str], cwd: Optional[Path] = None) -> str:
+    result = subprocess.run(
+        cmd, shell=False, cwd=cwd, capture_output=True, text=True
+    )
     if result.returncode != 0:
-        print(f"Command failed: {cmd}")
+        print(f"Command failed: {' '.join(cmd)}")
         print(result.stderr)
         sys.exit(1)
     return result.stdout.strip()
 
 
-def setup(repo_path):
+def setup(repo_path: Path) -> Path:
     agent_dir = repo_path / ".agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
 
     gitignore = repo_path / ".gitignore"
-    content = gitignore.read_text() if gitignore.exists() else ""
-    if ".agent/" not in content:
+    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
+    has_agent = any(line.strip() == ".agent/" for line in lines)
+    if not has_agent:
         with open(gitignore, "a") as f:
             f.write("\n# Agent working directory\n.agent/\n")
 
     return agent_dir
 
 
-def get_step(agent_dir):
+def get_step(agent_dir: Path) -> Optional[str]:
     step_file = agent_dir / "step.txt"
     if not step_file.exists():
         return None
@@ -108,11 +111,11 @@ def get_step(agent_dir):
     return step
 
 
-def set_step(agent_dir, step):
+def set_step(agent_dir: Path, step: str) -> None:
     (agent_dir / "step.txt").write_text(step)
 
 
-def run_opencode(repo_path, instruction, step):
+def run_opencode(repo_path: Path, instruction: str, step: str) -> bool:
     prompt_file = repo_path / ".agent" / f"{step}_prompt.txt"
     prompt_file.write_text(instruction)
 
@@ -120,9 +123,9 @@ def run_opencode(repo_path, instruction, step):
     print(f"  Step: {step}")
     print(f"{'='*60}")
 
-    cmd = f'opencode --yes "{instruction}"'
+    cmd = ["opencode", "run", instruction]
     result = subprocess.run(
-        cmd, shell=True, cwd=str(repo_path), capture_output=True, text=True
+        cmd, shell=False, cwd=str(repo_path), capture_output=True, text=True
     )
     if result.returncode != 0:
         print(f"Step '{step}' failed (exit code: {result.returncode})")
@@ -134,7 +137,7 @@ def run_opencode(repo_path, instruction, step):
     return True
 
 
-def advance_step(agent_dir, step):
+def advance_step(agent_dir: Path, step: str) -> str:
     idx = STEPS.index(step)
     if idx + 1 < len(STEPS):
         next_step = STEPS[idx + 1]
@@ -155,7 +158,11 @@ def main():
     repo_url = sys.argv[1]
     branch = sys.argv[2] if len(sys.argv) > 2 else None
 
-    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+    repo_url_clean = repo_url.rstrip("/")
+    if ":" in repo_url_clean and "/" not in repo_url_clean.split(":")[0]:
+        repo_name = repo_url_clean.split(":")[-1].replace(".git", "").split("/")[-1]
+    else:
+        repo_name = repo_url_clean.split("/")[-1].replace(".git", "")
 
     workspace = Path.cwd() / "workspace"
     workspace.mkdir(exist_ok=True)
@@ -163,72 +170,84 @@ def main():
 
     if not repo_path.exists():
         print(f"Cloning {repo_url}...")
-        cmd = f"git clone {repo_url}"
+        cmd = ["git", "clone", repo_url]
         if branch:
-            cmd += f" -b {branch}"
-        run(cmd, cwd=str(workspace))
+            cmd += ["-b", branch]
+        run(cmd, cwd=workspace)
     else:
         print(f"Updating {repo_name}...")
-        run("git pull --ff-only", cwd=str(repo_path))
+        run(["git", "fetch", "origin"], cwd=repo_path)
+        branch_name = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+        if branch_name != "HEAD":
+            run(["git", "reset", "--hard", f"origin/{branch_name}"], cwd=repo_path)
 
     agent_dir = setup(repo_path)
-    original_branch = run("git rev-parse --abbrev-ref HEAD", cwd=str(repo_path))
-    step = get_step(agent_dir)
+    original_branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
 
-    if step is None:
-        step = STEPS[0]
-        set_step(agent_dir, step)
-        print(f"Starting with step: {step}")
-    elif step == "done":
-        print("All steps complete. Delete .agent/step.txt to restart.")
-        return
+    try:
+        step = get_step(agent_dir)
 
-    while step and step != "done":
-        instruction = STEP_INSTRUCTIONS[step]
-        ok = run_opencode(repo_path, instruction, step)
-        if not ok:
-            sys.exit(1)
+        if step is None:
+            step = STEPS[0]
+            set_step(agent_dir, step)
+            print(f"Starting with step: {step}")
+        elif step == "done":
+            print("All steps complete. Delete .agent/step.txt to restart.")
+            return
 
-        if step == "analyze":
-            branch_file = agent_dir / "branch.txt"
-            if branch_file.exists():
-                branch_name = branch_file.read_text().strip()
-                branch_file.unlink()
-                print(f"Creating and switching to branch: {branch_name}")
-                run(f"git checkout -b {branch_name}", cwd=str(repo_path))
-            new_step = get_step(agent_dir)
-            if new_step == step or new_step is None:
-                set_step(agent_dir, "done")
-                step = "done"
-                print("No issues found. Nothing to do.")
+        while step and step != "done":
+            instruction = STEP_INSTRUCTIONS[step]
+            ok = run_opencode(repo_path, instruction, step)
+            if not ok:
+                sys.exit(1)
+
+            if step == "analyze":
+                branch_file = agent_dir / "branch.txt"
+                if branch_file.exists():
+                    branch_name = branch_file.read_text().strip()
+                    branch_file.unlink()
+                    print(f"Creating and switching to branch: {branch_name}")
+                    run(["git", "checkout", "-b", branch_name], cwd=repo_path)
+                new_step = get_step(agent_dir)
+                if new_step == step or new_step is None:
+                    set_step(agent_dir, "done")
+                    step = "done"
+                    print("No issues found. Nothing to do.")
+                else:
+                    step = new_step
+            elif step in ("plan", "plan-check", "implement", "review"):
+                new_step = get_step(agent_dir)
+                expected = {"plan": "plan-check", "plan-check": ("plan", "implement"), "implement": ("plan-check", "review"), "review": ("implement", "plan-check", "done")}
+                if new_step == step or new_step is None:
+                    fallback = expected[step] if isinstance(expected[step], str) else expected[step][0]
+                    print(f"Agent did not advance from {step}, defaulting to {fallback}")
+                    set_step(agent_dir, fallback)
+                    step = fallback
+                else:
+                    print(f"After {step}, agent set next step to: {new_step}")
+                    step = new_step
             else:
-                step = new_step
-        elif step in ("plan", "plan-check", "implement", "review"):
-            new_step = get_step(agent_dir)
-            expected = {"plan": "plan-check", "plan-check": ("plan", "implement"), "implement": ("plan-check", "review"), "review": ("implement", "plan-check", "done")}
-            if new_step == step or new_step is None:
-                fallback = expected[step] if isinstance(expected[step], str) else expected[step][0]
-                print(f"Agent did not advance from {step}, defaulting to {fallback}")
-                set_step(agent_dir, fallback)
-                step = fallback
-            else:
-                print(f"After {step}, agent set next step to: {new_step}")
-                step = new_step
-        else:
-            step = advance_step(agent_dir, step)
+                step = advance_step(agent_dir, step)
 
-    current_branch = run("git rev-parse --abbrev-ref HEAD", cwd=str(repo_path))
-    if current_branch != original_branch:
-        print(f"Committing and pushing branch: {current_branch}")
-        note_file = agent_dir / "note.txt"
-        msg = "Agent changes"
-        if note_file.exists():
-            msg = note_file.read_text().strip()[:72]
-        run("git add -A", cwd=str(repo_path))
-        run(f'git commit -m "{msg}"', cwd=str(repo_path))
-        run(f"git push origin {current_branch}", cwd=str(repo_path))
-        print(f"Switching back to: {original_branch}")
-        run(f"git checkout {original_branch}", cwd=str(repo_path))
+        current_branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+        if current_branch != original_branch:
+            print(f"Committing and pushing branch: {current_branch}")
+            note_file = agent_dir / "note.txt"
+            msg = "Agent changes"
+            if note_file.exists():
+                raw = note_file.read_text().strip()
+                msg = raw.encode("utf-8")[:72].decode("utf-8", errors="ignore")
+            run(["git", "add", "-A"], cwd=repo_path)
+            run(["git", "commit", "-m", msg], cwd=repo_path)
+            run(["git", "push", "origin", current_branch], cwd=repo_path)
+            print(f"Switching back to: {original_branch}")
+            run(["git", "checkout", original_branch], cwd=repo_path)
+    finally:
+        final_branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+        if final_branch != original_branch:
+            print(f"Cleaning up: switching back to {original_branch}")
+            run(["git", "checkout", original_branch], cwd=repo_path)
+
     print("\nAll steps completed successfully!")
 
 
